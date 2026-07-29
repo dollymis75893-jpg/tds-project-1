@@ -147,7 +147,7 @@ def poll_telegram():
     offset = None
     while True:
         try:
-            url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/getUpdates"
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
             params = {"timeout": 30, "offset": offset}
             resp = requests.get(url, params=params).json()
             
@@ -162,22 +162,11 @@ def poll_telegram():
                         reply_json = process_message(chat_id, text)
                         
                         # Send back to Telegram
-                        send_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){BOT_TOKEN}/sendMessage"
+                        send_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
                         requests.post(send_url, json={"chat_id": chat_id, "text": reply_json})
         except Exception as e:
             print(f"Telegram polling error: {e}")
             time.sleep(2)
-
-# ---------------------------------------------------------
-# 7. KEEP-ALIVE PINGER (Prevents Render from sleeping)
-# ---------------------------------------------------------
-def keep_alive():
-    while True:
-        try:
-            requests.get(f"{BASE_URL}/health")
-        except:
-            pass
-        time.sleep(600) # Ping every 10 minutes
 
 # ---------------------------------------------------------
 # 8. STARTUP
