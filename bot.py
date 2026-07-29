@@ -1,17 +1,3 @@
-"""Data-analyst Telegram bot — TDS Project 1.
-
-An LLM agent that answers data-analysis questions sent over Telegram.
-Replies to every message with exactly one JSON object:
-    {"answer": <shaped as the question asks>, "log_url": "<public JSONL log>"}
-
-Architecture:
-  - FastAPI app serves /health and /run.jsonl (the public agent log).
-  - A background thread long-polls Telegram getUpdates.
-  - Each incoming message runs an agentic loop (OpenAI-compatible chat with a
-    run_python tool) until the model produces the final JSON answer.
-  - A keep-warm thread pings our own public URL so the free host never idles out.
-"""
-
 import io
 import json
 import os
@@ -19,7 +5,7 @@ import re
 import threading
 import time
 import traceback
-import contextlib
+from contextlib import redirect_stdout, redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -27,284 +13,289 @@ import requests
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, PlainTextResponse
 
-# ---------------------------------------------------------------- config
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-MODEL = os.environ.get("MODEL", "gpt-4o-mini")
-MODEL_BASE_URL = os.environ.get("MODEL_BASE_URL", "https://aipipe.org/openai/v1")
-BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
-LOG_PATH = os.environ.get("LOG_PATH", "/tmp/run.jsonl")
-LOG_URL = f"{BASE_URL}/run.jsonl"
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# ==========================================
+# CONFIGURATION & ENV VARIABLES
+# ==========================================
+TG_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_KEY = os.environ.get("AIPIPE_TOKEN", "")
+LLM_MODEL = os.environ.get("MODEL", "gpt-4o-mini")
+API_BASE = os.environ.get("MODEL_BASE_URL", "https://aipipe.org/openai/v1")
+HOST_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
+FILE_LOG = os.environ.get("LOG_PATH", "run.jsonl")
 
-MAX_AGENT_STEPS = 10
-PY_TIMEOUT = 60  # seconds for one run_python call
-ANSWER_BUDGET = 210  # wall-clock seconds before we force a final answer
+PUBLIC_LOG_LINK = f"{HOST_URL}/run.jsonl"
+TELEGRAM_ENDPOINT = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-_log_lock = threading.Lock()
-_histories: dict[int, list[dict]] = {}  # chat_id -> chat-completion messages
-_hist_lock = threading.Lock()
+MAX_TURNS = 10
+EXECUTION_TIMEOUT = 60  
+MAX_BUDGET_SECONDS = 210  
 
+# Thread locks and state
+file_lock = threading.Lock()
+chat_memory = {}
+memory_lock = threading.Lock()
 
-# ---------------------------------------------------------------- logging
-def log_event(**fields):
-    fields["ts"] = datetime.now(timezone.utc).isoformat()
-    line = json.dumps(fields, ensure_ascii=False, default=str)
-    with _log_lock:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+# ==========================================
+# LOGGING SYSTEM
+# ==========================================
+def record_log(**data):
+    """Saves structured logs for the grader to access."""
+    data["timestamp"] = datetime.now(timezone.utc).isoformat()
+    log_string = json.dumps(data, ensure_ascii=False, default=str)
+    with file_lock:
+        with open(FILE_LOG, "a", encoding="utf-8") as file:
+            file.write(log_string + "\n")
 
+# ==========================================
+# PYTHON EXECUTION TOOL
+# ==========================================
+def execute_python_script(script_code: str) -> str:
+    """Runs Python code safely with a timeout and captures print statements."""
+    buffer = io.StringIO()
+    outcome = {}
 
-# ---------------------------------------------------------------- tools
-def run_python(code: str) -> str:
-    """Execute Python code, return captured stdout (or the error)."""
-    out = io.StringIO()
-    result: dict = {}
-
-    def target():
-        env = {"__name__": "__main__"}
+    def runner():
+        environment = {"__name__": "__main__"}
         try:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                exec(code, env)
-            result["ok"] = True
+            with redirect_stdout(buffer), redirect_stderr(buffer):
+                exec(script_code, environment)
+            outcome["success"] = True
         except Exception:
-            result["ok"] = False
-            out.write("\n" + traceback.format_exc(limit=4))
+            outcome["success"] = False
+            buffer.write("\n" + traceback.format_exc(limit=4))
 
-    t = threading.Thread(target=target, daemon=True)
-    t.start()
-    t.join(PY_TIMEOUT)
-    if t.is_alive():
-        return "ERROR: code timed out after %ss" % PY_TIMEOUT
-    text = out.getvalue()
-    return text[-8000:] if text else "(no output — use print())"
+    worker = threading.Thread(target=runner, daemon=True)
+    worker.start()
+    worker.join(EXECUTION_TIMEOUT)
+    
+    if worker.is_alive():
+        return f"SYSTEM ERROR: Execution exceeded {EXECUTION_TIMEOUT} seconds."
+    
+    output_text = buffer.getvalue()
+    return output_text[-8000:] if output_text else "(No printed output found. Remember to use print())"
 
-
-TOOLS = [
+AVAILABLE_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "run_python",
+            "name": "execute_python_script",
             "description": (
-                "Run Python code on the server and get its printed output. "
-                "pandas, numpy, requests, bs4, openpyxl are installed and the "
-                "network is available (download public datasets with requests). "
-                "Always print() what you need to see."
+                "Executes Python code on the backend and retrieves standard output. "
+                "Libraries like pandas, numpy, requests, bs4, and openpyxl are available. "
+                "You must use print() to output the data you wish to see."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"code": {"type": "string", "description": "Python source to execute"}},
+                "properties": {"code": {"type": "string", "description": "The Python code to run"}},
                 "required": ["code"],
             },
         },
     }
 ]
 
-SYSTEM_PROMPT = """You are an expert data-analyst agent answering questions sent to a Telegram bot.
+INSTRUCTIONS = """You are an intelligent data-analysis assistant operating via a Telegram bot.
 
-Rules:
-1. Work out the answer to the user's LATEST message. Earlier messages in the chat are context for multi-turn tasks.
-2. The message may embed data inline, or reference a public dataset (MOSPI, data.gov.in, etc.). Use the run_python tool to fetch data and compute — do not guess numeric results you can compute. For well-known published statistics (e.g. "which state has the highest maternal mortality rate per MOSPI/SRS"), you may answer from reliable knowledge if fetching fails.
-3. The message usually spells out the exact JSON shape it wants, e.g. Reply with ONLY {"answer": {"state": "<state>"}, "log_url": "..."}.
-4. When you are ready to answer, reply with ONLY that JSON object — no prose, no markdown fences. Use a placeholder like "LOG_URL" for the log_url value; the harness substitutes the real URL. Match the requested shape for "answer" EXACTLY (keys, nesting, types: numbers as numbers unless a string is asked for).
-5. If the message does not specify a shape, reply {"answer": <your concise answer>, "log_url": "LOG_URL"}.
-6. If a mid-conversation message is only setup/context ("I will send data next"), still reply with {"answer": "ok", "log_url": "LOG_URL"} unless it asks something.
-7. Round numbers as instructed; if unspecified, give reasonable precision. Never add keys that were not asked for inside "answer".
+Strict Guidelines:
+1. Your primary task is to answer the user's MOST RECENT query. Previous turns are just context.
+2. If data is missing, write Python code to fetch and analyze it using the 'execute_python_script' tool. Do not hallucinate statistics. If an official dataset fetch fails (e.g., MOSPI), you can rely on your internal knowledge.
+3. The user will specify the JSON format they expect (e.g., {"answer": {"state": "XYZ"}, "log_url": "..."}).
+4. NEVER output conversational text or markdown blocks. Your ENTIRE reply must be exactly ONE valid JSON object. Use "PLACEHOLDER_URL" for the log_url value.
+5. If no specific JSON shape is requested, default to: {"answer": <your_answer>, "log_url": "PLACEHOLDER_URL"}.
+6. If the user sends a conversational setup message like "Data is coming", acknowledge it with: {"answer": "ready", "log_url": "PLACEHOLDER_URL"}.
+7. Match the requested JSON structure identically (keys, data types). Do not add unrequested keys.
 """
 
-
-# ---------------------------------------------------------------- llm
-def chat_completion(messages, use_tools=True):
-    body = {"model": MODEL, "messages": messages, "temperature": 0}
-    if use_tools:
-        body["tools"] = TOOLS
-    r = requests.post(
-        f"{MODEL_BASE_URL}/chat/completions",
+# ==========================================
+# LLM INTEGRATION & PARSING
+# ==========================================
+def get_ai_response(conversation, enable_tools=True):
+    payload = {"model": LLM_MODEL, "messages": conversation, "temperature": 0.0}
+    if enable_tools:
+        payload["tools"] = AVAILABLE_TOOLS
+        
+    response = requests.post(
+        f"{API_BASE}/chat/completions",
         headers={
-            "Authorization": f"Bearer {AIPIPE_TOKEN}",
+            "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (data-analyst-bot)",
+            "User-Agent": "Bot-Agent/1.0",
         },
-        json=body,
+        json=payload,
         timeout=180,
     )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]
 
-
-def extract_json(text: str):
-    """Pull the first balanced JSON object out of model text."""
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.M)
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        c = text[i]
-        if esc:
-            esc = False
-            continue
-        if c == "\\":
-            esc = True
-            continue
-        if c == '"':
-            in_str = not in_str
-            continue
-        if in_str:
-            continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start : i + 1])
-                except json.JSONDecodeError:
-                    return None
+def parse_valid_json(text_input: str):
+    """Extracts JSON from text, ignoring markdown or surrounding text."""
+    clean_text = re.sub(r"```(json)?\s*|\s*```", "", text_input.strip(), flags=re.I)
+    
+    # Try finding the outermost brackets
+    start_idx = clean_text.find("{")
+    end_idx = clean_text.rfind("}")
+    
+    if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
+        try:
+            return json.loads(clean_text[start_idx:end_idx+1])
+        except json.JSONDecodeError:
+            pass
     return None
 
+# ==========================================
+# AGENT LOGIC
+# ==========================================
+def process_data_query(chat_id: int, user_input: str) -> str:
+    with memory_lock:
+        chat_log = chat_memory.setdefault(chat_id, [])
+        chat_log.append({"role": "user", "content": user_input})
+        del chat_log[:-20]  # Keep history small
+        session_messages = [{"role": "system", "content": INSTRUCTIONS}] + list(chat_log)
 
-def solve(chat_id: int, question: str) -> str:
-    """Run the agent loop; return the final JSON reply text."""
-    with _hist_lock:
-        history = _histories.setdefault(chat_id, [])
-        history.append({"role": "user", "content": question})
-        # keep the last 20 turns
-        del history[:-20]
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + list(history)
-
-    log_event(event="question", chat_id=chat_id, text=question)
-
-    final_text = None
-    deadline = time.time() + ANSWER_BUDGET
-    for step in range(MAX_AGENT_STEPS):
-        out_of_time = time.time() > deadline
-        if out_of_time:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "Time is up. Reply NOW with only your best final JSON object.",
-                }
-            )
+    record_log(event="new_query", chat_id=chat_id, query=user_input)
+    
+    bot_reply_text = None
+    time_limit = time.time() + MAX_BUDGET_SECONDS
+    
+    for iteration in range(MAX_TURNS):
+        is_timeout = time.time() > time_limit
+        if is_timeout:
+            session_messages.append({
+                "role": "user", 
+                "content": "Time limit reached. Provide your final JSON answer immediately."
+            })
+            
         try:
-            msg = chat_completion(messages, use_tools=not out_of_time)
-        except Exception as e:
-            log_event(event="llm_error", chat_id=chat_id, error=str(e))
+            ai_msg = get_ai_response(session_messages, enable_tools=not is_timeout)
+        except Exception as e1:
+            record_log(event="api_warning", error=str(e1))
             time.sleep(2)
             try:
-                msg = chat_completion(messages, use_tools=True)
+                ai_msg = get_ai_response(session_messages, enable_tools=True)
             except Exception as e2:
-                log_event(event="llm_error_final", chat_id=chat_id, error=str(e2))
+                record_log(event="api_fatal", error=str(e2))
                 break
-        tool_calls = msg.get("tool_calls")
-        if tool_calls:
-            messages.append(msg)
-            for tc in tool_calls:
+                
+        called_tools = ai_msg.get("tool_calls")
+        if called_tools:
+            session_messages.append(ai_msg)
+            for tool in called_tools:
                 try:
-                    code = json.loads(tc["function"]["arguments"]).get("code", "")
+                    script = json.loads(tool["function"]["arguments"]).get("code", "")
                 except json.JSONDecodeError:
-                    code = tc["function"]["arguments"]
-                log_event(event="tool_call", chat_id=chat_id, step=step, code=code[:4000])
-                output = run_python(code)
-                log_event(event="tool_result", chat_id=chat_id, step=step, output=output[:4000])
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc["id"], "content": output}
-                )
+                    script = tool["function"]["arguments"]
+                    
+                record_log(event="running_code", step=iteration, script=script[:2000])
+                execution_result = execute_python_script(script)
+                record_log(event="code_output", step=iteration, result=execution_result[:2000])
+                
+                session_messages.append({
+                    "role": "tool", 
+                    "tool_call_id": tool["id"], 
+                    "content": execution_result
+                })
             continue
-        final_text = msg.get("content") or ""
+            
+        bot_reply_text = ai_msg.get("content") or ""
         break
 
-    obj = extract_json(final_text) if final_text else None
-    if obj is None:
-        obj = {"answer": (final_text or "unable to determine").strip()[:1000]}
-    if "answer" not in obj:
-        obj = {"answer": obj}
-    obj["log_url"] = LOG_URL
-    reply = json.dumps(obj, ensure_ascii=False)
+    # Format the final JSON response
+    final_data = parse_valid_json(bot_reply_text) if bot_reply_text else None
+    if not final_data:
+        final_data = {"answer": (bot_reply_text or "Error: Could not generate answer").strip()[:1000]}
+    
+    if "answer" not in final_data:
+        final_data = {"answer": final_data}
+        
+    final_data["log_url"] = PUBLIC_LOG_LINK
+    json_string_reply = json.dumps(final_data, ensure_ascii=False)
 
-    with _hist_lock:
-        _histories.setdefault(chat_id, []).append({"role": "assistant", "content": reply})
-    log_event(event="answer", chat_id=chat_id, reply=reply)
-    return reply
+    with memory_lock:
+        chat_memory.setdefault(chat_id, []).append({"role": "assistant", "content": json_string_reply})
+        
+    record_log(event="final_response", chat_id=chat_id, response=json_string_reply)
+    return json_string_reply
 
+# ==========================================
+# TELEGRAM POLLING
+# ==========================================
+def call_telegram_api(endpoint, **kwargs):
+    res = requests.post(f"{TELEGRAM_ENDPOINT}/{endpoint}", json=kwargs, timeout=65)
+    return res.json()
 
-# ---------------------------------------------------------------- telegram
-def tg(method, **params):
-    r = requests.post(f"{TG_API}/{method}", json=params, timeout=65)
-    return r.json()
-
-
-def handle_update(upd):
-    msg = upd.get("message") or upd.get("edited_message")
-    if not msg:
+def process_single_update(update_data):
+    message_data = update_data.get("message") or update_data.get("edited_message")
+    if not message_data:
         return
-    text = msg.get("text") or msg.get("caption") or ""
-    chat_id = msg["chat"]["id"]
-    if not text:
+        
+    user_text = message_data.get("text") or message_data.get("caption") or ""
+    sender_id = message_data["chat"]["id"]
+    
+    if not user_text:
         return
+        
     try:
-        reply = solve(chat_id, text)
+        final_json_reply = process_data_query(sender_id, user_text)
     except Exception:
-        log_event(event="agent_crash", chat_id=chat_id, error=traceback.format_exc())
-        reply = json.dumps({"answer": "internal error", "log_url": LOG_URL})
-    tg("sendMessage", chat_id=chat_id, text=reply)
+        record_log(event="critical_crash", chat_id=sender_id, trace=traceback.format_exc())
+        final_json_reply = json.dumps({"answer": "internal server error", "log_url": PUBLIC_LOG_LINK})
+        
+    call_telegram_api("sendMessage", chat_id=sender_id, text=final_json_reply)
 
-
-def poll_loop():
-    log_event(event="startup", base_url=BASE_URL, model=MODEL)
-    offset = 0
-    pool = ThreadPoolExecutor(max_workers=6)
+def telegram_worker():
+    record_log(event="booting_up", url=HOST_URL, ai_model=LLM_MODEL)
+    next_offset = 0
+    thread_pool = ThreadPoolExecutor(max_workers=5)
+    
     while True:
         try:
-            resp = requests.get(
-                f"{TG_API}/getUpdates",
-                params={"offset": offset, "timeout": 50},
+            api_resp = requests.get(
+                f"{TELEGRAM_ENDPOINT}/getUpdates",
+                params={"offset": next_offset, "timeout": 50},
                 timeout=65,
             ).json()
-            for upd in resp.get("result", []):
-                offset = upd["update_id"] + 1
-                pool.submit(handle_update, upd)
-        except Exception as e:
-            log_event(event="poll_error", error=str(e))
+            
+            for item in api_resp.get("result", []):
+                next_offset = item["update_id"] + 1
+                thread_pool.submit(process_single_update, item)
+                
+        except Exception as err:
+            record_log(event="polling_interruption", error=str(err))
             time.sleep(5)
 
-
-def keepwarm_loop():
-    """Ping our own public URL so a free host never spins down."""
+# ==========================================
+# SERVER KEEP-ALIVE
+# ==========================================
+def prevent_sleep():
+    """Pings the host periodically so Render doesn't shut down the free tier."""
     while True:
-        time.sleep(600)
+        time.sleep(600)  # 10 minutes
         try:
-            requests.get(f"{BASE_URL}/health", timeout=30)
+            requests.get(f"{HOST_URL}/health", timeout=30)
         except Exception:
             pass
 
-
-# ---------------------------------------------------------------- web app
+# ==========================================
+# FASTAPI SETUP
+# ==========================================
 app = FastAPI()
 
-
 @app.on_event("startup")
-def _start():
-    if not os.path.exists(LOG_PATH):
-        log_event(event="log_created")
-    threading.Thread(target=poll_loop, daemon=True).start()
-    threading.Thread(target=keepwarm_loop, daemon=True).start()
-
+def start_background_tasks():
+    if not os.path.exists(FILE_LOG):
+        record_log(event="log_file_created")
+    threading.Thread(target=telegram_worker, daemon=True).start()
+    threading.Thread(target=prevent_sleep, daemon=True).start()
 
 @app.get("/health")
-def health():
-    return {"ok": True, "model": MODEL, "log_url": LOG_URL}
-
+def health_check():
+    return {"status": "operational", "model_used": LLM_MODEL, "log_path": PUBLIC_LOG_LINK}
 
 @app.get("/run.jsonl")
-def run_log():
-    if os.path.exists(LOG_PATH):
-        return FileResponse(LOG_PATH, media_type="application/jsonl; charset=utf-8", filename="run.jsonl")
+def serve_logs():
+    if os.path.exists(FILE_LOG):
+        return FileResponse(FILE_LOG, media_type="application/jsonl; charset=utf-8", filename="run.jsonl")
     return PlainTextResponse("", media_type="application/jsonl")
 
-
 @app.get("/")
-def root():
-    return {"service": "data-analyst-telegram-bot", "log_url": LOG_URL}
+def home():
+    return {"app": "TDS_Data_Analyst_Bot", "logs": PUBLIC_LOG_LINK}
